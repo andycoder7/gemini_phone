@@ -1,0 +1,15 @@
+
+LOCAL_PATH := $(call my-dir)
+
+include $(CLEAR_VARS)
+
+LOCAL_MODULE    := hello-jni
+LOCAL_SRC_FILES := hello-jni.cpp
+LOCAL_CPP_EXTENSION := .cpp
+LOCAL_SRC_FILES := $(SRC)
+LOCAL_ARM_MODE := arm
+LOCAL_CC := $(CC)
+LOCAL_CXX := $(CXX)
+LOCAL_CPPFLAGS := $(CFLAGS)
+LOCAL_LDLIBS :=$(LDFLAGS) 
+include $(BUILD_SHARED_LIBRARY)
