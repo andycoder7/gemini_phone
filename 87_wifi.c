@@ -44,7 +44,7 @@
 
 #define DEBUG
 #define DEB_INIT
-//#define PACKDEBUG
+#define DEB_DETAIL
 #define UIDEBUG
 #define ERR
 
@@ -90,14 +90,14 @@ int fd;
 int initflag = 0;
 
 
-int lastudp = 0;
-int firudp = 0;
+int lasttg   = 0;
+int lastwifi = 0;
 int lastn = 0;
 int firn = 0;
-static pthread_mutex_t MTX_DEAL = PTHREAD_MUTEX_INITIALIZER;
+//static pthread_mutex_t MTX_DEAL = PTHREAD_MUTEX_INITIALIZER;
 static pthread_mutex_t MTX_RECV = PTHREAD_MUTEX_INITIALIZER;
 //static pthread_mutex_t MTX_LOST = PTHREAD_MUTEX_INITIALIZER;
-static pthread_cond_t WAIT_DEAL = PTHREAD_COND_INITIALIZER;
+//static pthread_cond_t WAIT_DEAL = PTHREAD_COND_INITIALIZER;
 static pthread_cond_t WAIT_RECV = PTHREAD_COND_INITIALIZER;
 //static pthread_cond_t WAIT_LOST = PTHREAD_COND_INITIALIZER;
 
@@ -118,8 +118,7 @@ typedef unsigned char mac_addr[6];
 mac_addr SOURCE_MAC, GATEWAY_MAC;
 struct rtentry OLD_DEFAULT_ROUTE;
 char INTERFACE_NAME[64];
-unsigned char DATABUFF[BUF_LEN][MAX_BUFF];
-unsigned char *BIGBUFF[MAX_SEQ];
+unsigned char DATABUFF[MAX_SEQ][MAX_BUFF];
 
 /*
  * self_defined protocol head
@@ -536,7 +535,7 @@ int shunt(int serverfd)
 		uint8_t *data;
 		//char per[16];
 		//bzero((char *) per, sizeof(per));
-		char temp[16] = "0:1\0";
+		char temp[16] = "1:2\0";
 		//memcpy((char *) per, (const char*) temp, strlen(temp));
 
 		struct gemini_head hd1;
@@ -1235,6 +1234,37 @@ void double_channel_uicontrol()
 	}
 }
 
+int send_shunt(char * rate)
+{
+    uint8_t data[20] = {0};
+    struct gemini_head hd1;
+
+    data[0] = 2 + strlen(rate) + 1;
+    data[1] = 0;
+    data[2] = 11;
+
+    strcpy(data+3, rate);
+    sendto(tgfd, data, data[0] + 1, 0, (struct sockaddr *) &serveraddr, sizeof(serveraddr));
+#ifdef DEBUG
+    printf("modify rate to %s\n", rate);
+#endif
+    return 0;
+}
+
+int int2str(char *str, int num)
+{
+    int i = 0;
+    int t = num;
+    for(i = 0; t; i++, t = t/10);
+    str[i] = 0;
+    t = i;
+    while(i) {
+        str[--i] = num%10 +'0';
+        num = num/10;
+    }
+    return t;
+}
+
 void * recv_process(void *p)
 {
 	int vsock;
@@ -1246,9 +1276,13 @@ void * recv_process(void *p)
 
 	unsigned char buff[MAX_BUFF];
 	struct epoll_event event;
+	struct epoll_event events[MAX_IF];
 	int epfd = epoll_create(MAX_IF);
+    int epfds = 0;
+    int i;
+    int seq = 0;
 	int32_t len = 0;
-    int templastudp = 0;
+    int lasttemp = 0;
 	socklen_t alen;
 	alen = sizeof(struct sockaddr_in);
 
@@ -1258,82 +1292,45 @@ void * recv_process(void *p)
     event.data.fd = rsock[2];
     epoll_ctl(epfd, EPOLL_CTL_ADD, rsock[2], &event);
 	//use epoll for a lockless mutli-receive
-	while (epoll_wait(epfd, &event, 1, -1) != -1)
+	while ((epfds = epoll_wait(epfd, events, 2, -1)) != -1)
 	{
-        if (!(event.events & EPOLLIN) )
-        {
-            perror("epoll_wait");
-        }
+        for(i = 0; i < epfds; i++) {
+            if (!(events[i].events & EPOLLIN) )
+            {
+                perror("epoll_wait");
+                continue;
+            }
 
-        len = recvfrom(event.data.fd, (void *) buff, MAX_BUFF, 0,NULL,NULL);
-        //lenth of data
-        templastudp = (lastudp + 1) % BUF_LEN; 
-        while(DATABUFF[lastudp][0] != 0 && DATABUFF[templastudp][0] != 0) {
-#ifdef DEBUG
-            printf("waitting uploading package,firudp=%d,lastudp=%d,",firudp,lastudp);
-            printf("DATABUFF[lastudp][0] = %d, DATABUFF[templastudp][0] = %d\n",
-                    DATABUFF[lastudp][0], DATABUFF[templastudp][0]);
+            len = recvfrom(events[i].data.fd, (void *) buff, MAX_BUFF, 0,NULL,NULL);
+            seq = *(uint16_t*)(buff+7);
+            if( ((seq<firn) || (seq>(MAX_SEQ-SEQ_TOR) && firn<SEQ_TOR)) && !(seq<SEQ_TOR && firn>(MAX_SEQ-SEQ_TOR)) ) {
+#ifdef DEB_DETAIL
+                printf("get lost package from fd %d, which seq = %d \n", events[i].data.fd, seq);
 #endif
-            pthread_cond_wait(&WAIT_DEAL, &MTX_DEAL);
-            pthread_mutex_unlock(&MTX_DEAL);
-        }
+                write(vsock, (void *)(buff+9), len-9);
+            } else {
+#ifdef DEB_DETAIL
+                printf("get new package from fd %d, which seq = %d \n", events[i].data.fd, seq);
+#endif
+                memcpy((void *) (&DATABUFF[seq]), buff, (size_t) len);
 
-        memcpy((void *) (&DATABUFF[lastudp]), buff, (size_t) len);
-        lastudp = templastudp;
-        pthread_cond_signal(&WAIT_RECV);
-	} 
+                if(events[i].data.fd == rsock[2]) {
+                    if((seq>(MAX_SEQ-SEQ_TOR) && lastwifi<SEQ_TOR) || (lastwifi>(MAX_SEQ-SEQ_TOR) && seq<SEQ_TOR))
+                        lastwifi = lastwifi>seq?seq:lastwifi; // get the little one
+                    else
+                        lastwifi = lastwifi<seq?seq:lastwifi; // get the bigger one
+                } 
+
+                // lastn get the slow one
+                if(firn != lastwifi)
+                    pthread_cond_signal(&WAIT_RECV);
+            }
+        } 
+    }
 #ifdef ERR
     printf("[ERR]: epoll failed, and stop receiving\n");
 #endif
 	return (void *) 0;
-}
-
-void * recvdeal_process(void *p)
-{
-    int vsock;
-    struct sock* arg = NULL;
-    arg = (struct sock*) p;
-    vsock = arg->vsock;
-    uint16_t seq = 0;
-    while (1)
-    {
-        if (firudp != lastudp)
-        {
-            seq = *((uint16_t *) (DATABUFF[firudp]+7));
-
-            if( ((seq<firn) || (seq>(MAX_SEQ-SEQ_TOR) && firn<SEQ_TOR)) && !(seq<SEQ_TOR && firn>(MAX_SEQ-SEQ_TOR)) ) {
-                uint32_t len = *((uint32_t *)(DATABUFF[firudp]+3));
-                write(vsock, (void *)(DATABUFF[firudp]+9), len-2);
-                DATABUFF[firudp][0] = 0;
-                pthread_cond_signal(&WAIT_DEAL);
-#ifdef DEBUG
-                printf("get lost data package, seq: %d\n", *(uint16_t*)(DATABUFF[firudp]+7));
-#endif
-            }
-            else {
-                BIGBUFF[seq] = DATABUFF[firudp];
-//                if (seq == firn) {
-//                    pthread_cond_signal(&WAIT_LOST);
-//                }
-            }
-
-            if((seq>(MAX_SEQ-SEQ_TOR) && lastn<SEQ_TOR) || (lastn>(MAX_SEQ-SEQ_TOR) && seq<SEQ_TOR))
-                lastn = lastn>seq?seq:lastn;
-            else
-                lastn = lastn<seq?seq:lastn;
-
-            firudp = (firudp + 1) % BUF_LEN;
-        }
-        else
-        {
-#ifdef DEBUG
-            printf("waitting recv data, firudp = %d, lastudp = %d\n", firudp, lastudp);
-#endif
-            pthread_cond_wait(&WAIT_RECV, &MTX_RECV);
-            pthread_mutex_unlock(&MTX_RECV);
-        }
-    }
-    return (void *) 0;
 }
 
 
@@ -1345,61 +1342,31 @@ void * buff2tun0_process(void *p)
     arg = (struct sock*) p;
     vsock = arg->vsock;
 
-    struct timeval now;
-    struct timespec outtime;
-    int waitret = 0;
-
     while (1)
     {
-        if(lastn != firn)
+        if(lastwifi != firn)
         {
-            if(BIGBUFF[firn])
+            if(DATABUFF[firn][0])
             {
-                len = *((uint32_t *)(BIGBUFF[firn]+3));
-                write(vsock, (void *)(BIGBUFF[firn]+9), len-2);
-                BIGBUFF[firn][0] = 0;
-                pthread_cond_signal(&WAIT_DEAL);
-                BIGBUFF[firn] = NULL;
+                len = *((uint32_t *)(DATABUFF[firn]+3));
+                write(vsock, (void *)(DATABUFF[firn]+9), len-2);
+                DATABUFF[firn][0] = 0;
+#ifdef DEB_DETAIL
+                printf("upload package, which seq = %d, firn = %d, lastwifi = %d\n",
+                        *(uint16_t*)(DATABUFF[firn]+7), firn, lastwifi );
+#endif
             } else {
 #ifdef DEBUG
-                printf("waitting lost data package,firn=%d,lastn=%d\n",firn,lastn);
+                printf("lost data package,firn=%d,lastwifi=%d\n",firn,lastwifi);
 #endif
-                int n = 50;
-                while(n--)
-                {
-                    usleep(400);
-                    if(BIGBUFF[firn])
-                    {
-#ifdef DEBUG
-                        printf("get it\n");
-#endif
-                        firn--;
-                        break;
-                    }
-                }
-#ifdef DEBUG
-                if(n<0)
-                    printf("lost it\n");
-#endif
-//                gettimeofday(&now, NULL);
-//                outtime.tv_sec = now.tv_sec;
-//                outtime.tv_nsec = now.tv_usec * 1000 + 20000000;  timeout 20ms
-//                pthread_cond_timedwait(&WAIT_LOST, &MTX_LOST, &outtime);
-//                pthread_mutex_unlock(&MTX_LOST);
-//                if(BIGBUFF[firn])
-//                {
-//#ifdef DEBUG
-//                        printf("get it\n");
-//#endif
-//                        firn--;
-//                }
-//#ifdef DEBUG
-//                else {
-//                    printf("lost it\n");
-//                }
-//#endif
             }
             firn = (firn + 1) % MAX_SEQ;
+        } else {
+#ifdef DEBUG
+                printf("waitting recv package,firn=%d,lastwifi=%d\n",firn,lastwifi);
+#endif
+            pthread_cond_wait(&WAIT_RECV, &MTX_RECV);
+            pthread_mutex_unlock(&MTX_RECV);
         }
     }
     return (void *) 0;
@@ -1505,7 +1472,6 @@ int main(int argc, char *argv[])
 
     pthread_t tgs;
     pthread_t tgr;
-    pthread_t tgrdeal;
     pthread_t initfl;
     pthread_t b2t;
 
@@ -1556,7 +1522,11 @@ int main(int argc, char *argv[])
         {
             printf("3g address initialize failed!\n");
         }
-        shunt(tgfd);
+//        shunt(tgfd);
+        if(argc == 2)
+            send_shunt(argv[1]);
+        else
+            send_shunt("1:4");
 
 #ifdef DEBUG
         printf("shunt algorithm done.\n");
@@ -1603,12 +1573,6 @@ int main(int argc, char *argv[])
             exit(-1);
         }
 
-        if (pthread_create(&tgrdeal, NULL, recvdeal_process, (void *) &socks) != 0)
-        {
-            perror("recvdeal_process thread create error");
-            exit(-1);
-        }
-
         if (pthread_create(&b2t, NULL, buff2tun0_process, (void *) &socks) != 0)
         {
             perror("buff2tun0_process thread create error");
@@ -1631,12 +1595,6 @@ int main(int argc, char *argv[])
         if (pthread_join(tgr, NULL) != 0)
         {
             perror("join recv thread error");
-            exit(1);
-        }
-        
-        if (pthread_join(tgrdeal, NULL) != 0)
-        {
-            perror("join recvdeal thread error");
             exit(1);
         }
         

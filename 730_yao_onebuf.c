@@ -535,7 +535,7 @@ int shunt(int serverfd)
 		uint8_t *data;
 		//char per[16];
 		//bzero((char *) per, sizeof(per));
-		char temp[16] = "1:2\0";
+		char temp[16] = "0:1\0";
 		//memcpy((char *) per, (const char*) temp, strlen(temp));
 
 		struct gemini_head hd1;
