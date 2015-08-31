@@ -66,17 +66,25 @@
  * ip get from gemini module
  */
 
+int tgrecv = 0;
+int wifirecv = 0;
+int wifisend = 0;
+int tgsend = 0;
+
 int GMN_FLAG;
 int AUTO_FLAG;
-int RATE;
+char RATE_FLAG[10];
 int CONF_FLAG;
 int READY_FLAG;
 
 FILE *gmn_log;
 FILE *gmn_file;
-
-
-
+/*
+int pthread_gmn_send=0;
+int pthread_gmn_recv=0;
+int pthread_gmn_buff2tun=0;
+int pthread_mnt=0;
+*/
 
 struct sockaddr_in wifiip;
 struct sockaddr_in tgip;
@@ -102,41 +110,48 @@ int tunfd = 0;
 int fd;
 int initflag = 0;
 
-int mntok;
-int gmnok;
 
+char app_msg[128];
+char msg[128];
 
-int init = 0;
+int gmnok = 0;
+//int init = 0;
 
 //pthread_t dae;
-pthread_t tgs;
-pthread_t tgr;
+pthread_t tgs=0;
+pthread_t tgr=0;
 //pthread_t initfl;
-pthread_t gmn;
-pthread_t b2t;
-pthread_t mnt;
-pthread_t env;
-pthread_t ui;
+pthread_t gmn=0;
+pthread_t b2t=0;
+pthread_t mnt=0;
+pthread_t env=0;
+pthread_t ui=0;
 //pthread_t gmninit;
+void *tgs_join;
+void *tgr_join;
+void *b2t_join;
 
 
 int lasttg   = 0;
 int lastwifi = 0;
 int lastn = 0;
 int firn = 0;
-//static pthread_mutex_t MTX_DEAL = PTHREAD_MUTEX_INITIALIZER;
-static pthread_mutex_t MTX_RECV = PTHREAD_MUTEX_INITIALIZER;
-//static pthread_mutex_t MTX_LOST = PTHREAD_MUTEX_INITIALIZER;
-//static pthread_cond_t WAIT_DEAL = PTHREAD_COND_INITIALIZER;
-static pthread_cond_t WAIT_RECV = PTHREAD_COND_INITIALIZER;
-//static pthread_cond_t WAIT_LOST = PTHREAD_COND_INITIALIZER;
+
+pthread_mutex_t m_env;
+pthread_cond_t  c_env;
+pthread_mutex_t m_gmn;
+pthread_cond_t  c_gmn;
+pthread_mutex_t m_ui;
+pthread_cond_t  c_ui;
+pthread_mutex_t *MTX_RECV;
+pthread_cond_t *WAIT_RECV; 
 
 
 /*
  * flags about whether function has run successfully
  */
 int double_ch_flag_gmn = 0; //1 if gemini return s to ue through wifi socket
-int double_ch_flag_app = 1; //1 if app turn on wifi interface
+//int double_ch_flag_app = 1; //1 if app turn on wifi interface
 int autoshunt = 0; //1 if  automatically set the shunt persentage
 
 /*
@@ -188,7 +203,7 @@ struct sock socks = { .vsock = 0, .rsock = { 0, 0, 0, 0 } };
 typedef struct{
         int GMN_FLAG;
         int AUTO_FLAG;
-        char RATE[10];
+        char RATE_FLAG[10];
 }GMN_STRUCT;
 GMN_STRUCT gmn_struct;
 
@@ -197,7 +212,7 @@ GMN_STRUCT gmn_struct;
  * char* store the ip address
  * return 0 for success, -1 for failure
  */
-int get_local_ip(char* outip)
+int get_3g_ip(char* outip)
 {
 	int i = 0;
 	int sockfd;
@@ -245,10 +260,63 @@ int get_local_ip(char* outip)
 			continue;
 		}
 		strcpy(outip, ip);
-		return 0;
+		return 1;
 	}
-	return -1;
+	return 0;
 }
+int get_wifi_ip(char* outip)
+{
+	int i = 0;
+	int sockfd;
+	struct ifconf ifconf;
+	struct ifreq *ifreq;
+	char buf[512];
+	char* ip;
+	/*
+	 * initial ifconf
+	 */
+	ifconf.ifc_len = 512;
+	ifconf.ifc_buf = buf;
+
+	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+	{
+		return -1;
+	}
+	/*
+	 * fatch all the possible interface information
+	 */
+	ioctl(sockfd, SIOCGIFCONF, &ifconf);
+	close(sockfd);
+
+	/*
+	 * fatch the ip address one by one
+	 */
+	ifreq = (struct ifreq*) buf;
+	for (i = (ifconf.ifc_len / sizeof(struct ifreq)); i > 0; i--)
+	{
+		ip = inet_ntoa(((struct sockaddr_in*) &(ifreq->ifr_addr))->sin_addr);
+		/*
+		 *ignore 127.0.0.1
+		 */
+		if (strcmp(ip, "127.0.0.1") == 0)
+		{
+			ifreq++;
+			continue;
+		}
+		/*
+		 * ignore other interface but 3g
+		 */
+		if (strcmp(ifreq->ifr_ifrn.ifrn_name, "wlan0") != 0)
+		{
+			ifreq++;
+			continue;
+		}
+		strcpy(outip, ip);
+		return 1;
+	}
+	return 0;
+}
+
 
 int change_3g_ip()
 {
@@ -646,145 +714,6 @@ int shunt_auto(int serverfd)
 /*
  * get the signal strength of wifi interface
  */
-unsigned char wifi_sig_strength()
-{
-	int sockfd;
-	struct iw_statistics stats;
-	struct iwreq req;
-
-	memset(&stats, 0, sizeof(struct iw_statistics));
-	memset(&req, 0, sizeof(struct iwreq));
-	sprintf(req.ifr_name, "wlan0");
-	req.u.data.pointer = &stats;
-	req.u.data.length = sizeof(struct iw_statistics);
-
-#ifdef CLEAR_UPDATED
-	req.u.data.flags = 1;
-#endif
-
-	/*
-	 * Any old socket will do, and a datagram socket is pretty cheap
-	 */
-
-	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
-	{
-		perror("Could not create simple datagram socket");
-		exit(EXIT_FAILURE);
-	}
-
-	/*
-	 * Perform the ioctl
-	 */
-	if (ioctl(sockfd, SIOCGIWSTATS, &req) == -1)
-	{
-		perror("Error performing SIOCGIWSTATS");
-		close(sockfd);
-		exit(EXIT_FAILURE);
-	}
-
-	close(sockfd);
-	printf("Signal level%s is %d%s.\n",
-			(stats.qual.updated & IW_QUAL_DBM ? " (in dBm)" : ""),
-			(signed char) stats.qual.level,
-			(stats.qual.updated & IW_QUAL_LEVEL_UPDATED ? " (updated)" : ""));
-
-	return stats.qual.level;
-
-}
-
-/*
- * get the bitrate of wifi interface
- */
-int wifi_bitrate()
-{
-	int sockfd;
-	struct iw_statistics stats;
-	struct iwreq req;
-	union iwreq_data speed;
-
-	memset(&stats, 0, sizeof(struct iw_statistics));
-	memset(&req, 0, sizeof(struct iwreq));
-	memset(&speed, 0, sizeof(union iwreq_data));
-
-	sprintf(req.ifr_name, "wlan0");
-	req.u.data.pointer = &speed.bitrate;
-	req.u.data.length = sizeof(struct iw_param);
-
-#ifdef CLEAR_UPDATED
-	req.u.data.flags = 1;
-#endif
-
-	/* Any old socket will do, and a datagram socket is pretty cheap */
-
-	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
-	{
-		perror("Could not create simple datagram socket");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Perform the ioctl */
-	if (ioctl(sockfd, SIOCGIWRATE, &req) == -1)
-	{
-		perror("Error performing SIOCGIWSTATS");
-
-		close(sockfd);
-		exit(EXIT_FAILURE);
-	}
-
-	close(sockfd);
-
-	printf("wifi rate is %d Mbps\n", req.u.bitrate.value / 1000000);
-
-	sleep(1);
-
-	return req.u.bitrate.value / 1000000;
-}
-
-/*
- * get the bitrate of 3g interface
- */
-int tg_bitrate()
-{
-	int sockfd;
-	struct iw_statistics stats;
-	struct iwreq req;
-	union iwreq_data speed;
-
-	memset(&stats, 0, sizeof(struct iw_statistics));
-	memset(&req, 0, sizeof(struct iwreq));
-	memset(&speed, 0, sizeof(union iwreq_data));
-
-	sprintf(req.ifr_name, "rmnet0");
-	req.u.data.pointer = &speed.bitrate;
-	req.u.data.length = sizeof(struct iw_param);
-
-#ifdef CLEAR_UPDATED
-	req.u.data.flags = 1;
-#endif
-
-	/* Any old socket will do, and a datagram socket is pretty cheap */
-
-	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) == -1)
-	{
-		perror("Could not create simple datagram socket");
-		exit(EXIT_FAILURE);
-	}
-
-	/* Perform the ioctl */
-	if (ioctl(sockfd, SIOCGIWRATE, &req) == -1)
-	{
-		perror("Error performing SIOCGIWSTATS");
-
-		close(sockfd);
-		exit(EXIT_FAILURE);
-	}
-
-	close(sockfd);
-
-	printf("wifi rate is %d Mbps\n", req.u.bitrate.value / 1000000);
-
-	return req.u.bitrate.value / 1000000;
-}
 
 int interface_up(char *interface_name)
 {
@@ -1071,51 +1000,404 @@ int route_change(char * interface_name)
 	return 0;
 }
 
-void recovery_route()
+
+
+int int2str(char *str, int num)
 {
-#ifdef DEBUG
-	printf("now recover the route...\n");
+    int i = 0;
+    int t = num;
+    for(i = 0; t; i++, t = t/10);
+    str[i] = 0;
+    t = i;
+    while(i) {
+        str[--i] = num%10 +'0';
+        num = num/10;
+    }
+    return t;
+}
+
+
+
+void * buff2tun0_process(void *p)
+{
+    int vsock;
+    int32_t len = 0;
+    struct sock* arg = NULL;
+    arg = (struct sock*) p;
+    vsock = arg->vsock;
+    //slepp(1);
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+    while (1)
+    {
+        //lasttg >= firn
+        if(lasttg != firn)
+        {
+            if(DATABUFF[firn][0])
+            {
+                len = *((uint32_t *)(DATABUFF[firn]+3));
+                write(vsock, (void *)(DATABUFF[firn]+9), len-2);
+                DATABUFF[firn][0] = 0;
+#ifdef DEB_DETAIL
+                fprintf(gmn_log,"upload package, which seq = %d, firn = %d, lasttg = %d\n",
+                        *(uint16_t*)(DATABUFF[firn]+7), firn, lasttg );
 #endif
+            } else {
+#ifdef DEBUG
+                fprintf(gmn_log,"lost data package,firn=%d,lasttg=%d\n",firn,lasttg);
+#endif
+            }
+            firn = (firn + 1) % MAX_SEQ;
+        } else {
+#ifdef DEBUG
+                fprintf(gmn_log,"waitting recv package,firn=%d,lasttg=%d\n",firn,lasttg);
+#endif
+            pthread_mutex_lock(MTX_RECV);
+            pthread_cond_wait(WAIT_RECV, MTX_RECV);
+            pthread_mutex_unlock(MTX_RECV);
+        }
+    }
+    return (void *) 0;
+}
 
-	//int skfd;
-	struct rtentry rt;
 
+void * recv_process(void *p)
+{
+	int vsock;
+	int *rsock;
+	struct sock* arg = NULL;
+	arg = (struct sock*) p;
+	vsock = arg->vsock;
+	rsock = arg->rsock;
+
+    MTX_RECV = (pthread_mutex_t *) malloc(sizeof(pthread_mutex_t));
+    WAIT_RECV = (pthread_cond_t *) malloc(sizeof(pthread_cond_t));
+    pthread_mutex_init(MTX_RECV,NULL);
+    pthread_cond_init(WAIT_RECV,NULL);
+
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+
+	unsigned char buff[MAX_BUFF];
+	struct epoll_event event;
+	struct epoll_event events[MAX_IF];
+	int epfd = epoll_create(MAX_IF);
+    int epfds = 0;
+    int i;
+    int seq = 0;
+	int32_t len = 0;
+    int lasttemp = 0;
+
+    tgrecv = 0;
+    wifirecv = 0;
+
+	socklen_t alen;
+	alen = sizeof(struct sockaddr_in);
+
+	event.events = EPOLLIN;
+    event.data.fd = rsock[0];
+    epoll_ctl(epfd, EPOLL_CTL_ADD, rsock[0], &event);
+    event.data.fd = rsock[2];
+    epoll_ctl(epfd, EPOLL_CTL_ADD, rsock[2], &event);
+	//use epoll for a lockless mutli-receive
+	while ((epfds = epoll_wait(epfd, events, 2, -1)) != -1)
+	{
+        for(i = 0; i < epfds; i++) {
+            if (!(events[i].events & EPOLLIN) )
+            {
+                fprintf(gmn_log,"epoll_wait");
+                continue;
+            }
+
+            len = recvfrom(events[i].data.fd, (void *) buff, MAX_BUFF, 0,NULL,NULL);
+            if(events[i].data.fd == rsock[0])
+            {
+                tgrecv++;
+            }
+            else
+            {
+                wifirecv++;
+            }
+            seq = *(uint16_t*)(buff+7);
+            if( ((seq<firn) || (seq>(MAX_SEQ-SEQ_TOR) && firn<SEQ_TOR)) && !(seq<SEQ_TOR && firn>(MAX_SEQ-SEQ_TOR)) ) {
+#ifdef DEB_DETAIL
+                fprintf(gmn_log,"get lost package from fd %d, which seq = %d \n", events[i].data.fd, seq);
+#endif
+                write(vsock, (void *)(buff+9), len-9);
+            } else {
+#ifdef DEB_DETAIL
+                fprintf(gmn_log,"get new package from fd %d, which seq = %d \n", events[i].data.fd, seq);
+#endif
+                memcpy((void *) (&DATABUFF[seq]), buff, (size_t) len);
+
+                if(events[i].data.fd == rsock[0]) {
+                    if((seq>(MAX_SEQ-SEQ_TOR) && lasttg<SEQ_TOR) || (lasttg>(MAX_SEQ-SEQ_TOR) && seq<SEQ_TOR))
+                        lasttg = lasttg>seq?seq:lasttg; // get the little one
+                    else
+                        lasttg = lasttg<seq?seq:lasttg; // get the bigger one
+                } 
+
+                // lastn get the slow one
+                if(firn != lasttg)
+                    pthread_cond_signal(WAIT_RECV);
+            }
+        } 
+    }
+#ifdef ERR
+    fprintf(gmn_log,"[ERR]: epoll failed, and stop receiving\n");
+    pthread_exit((void *)-1);
+#endif
+	return (void *) 0;
+}
+/*
+ * determine whether to send data through 3g or wifi interface,
+ *
+ */
+void * send_process(void *p)
+{
+    int vsock;
+    int *rsock;
+    int tgflag = 1; //mark if send through 3G channel
+    struct sock* arg = NULL;
+    arg = (struct sock*) p;
+
+    tgsend = 0;
+    wifisend = 0;
+
+    vsock = arg->vsock;
+    rsock = arg->rsock;
+    uint32_t len;
+    char buff[MAX_BUFF];
+    uint8_t selfhd[2048];
+
+    pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, NULL);
+    pthread_setcanceltype(PTHREAD_CANCEL_ASYNCHRONOUS, NULL);
+
+    bzero((void *) selfhd, sizeof(selfhd));
+    int count;
+    while (1)
+    {
+        if (tgflag == 1) //send through 3g interface
+        {
+            //tgflag = 0;
+            bzero((void *) buff, sizeof(buff));
+            len = read(vsock, buff, MAX_BUFF);
+            if (len == -1)
+            {
+                fprintf(gmn_log,"3g read error\n");
+                pthread_exit((void *)-1);
+            }
+
+            bzero((void *) selfhd, sizeof(selfhd));
+            selfhd[0] = 6;
+            selfhd[1] = 0;
+            selfhd[2] = 21;
+            uint32_t *hd3 = (uint32_t *) (&selfhd[3]);
+            *hd3 = len;
+            memcpy(&selfhd[7], buff, len);
+
+            /*
+             * head lenth: ?
+             * direction: 0 3g->gemini
+             * type: 21 data to IUH
+             */
+            //self-defined protocol head
+            sendto(rsock[0], selfhd, 7 + len, 0,
+                    (struct sockaddr *) &serveraddr, sizeof(serveraddr));
+            tgsend++;
+
+        }
+        else //send through wifi channel
+        {
+            //tgflag = 1; //change the flag to send through 3g interface
+            bzero((void *) buff, sizeof(buff));
+            len = read(vsock, buff, MAX_BUFF);
+            {
+                if (len == -1)
+                {
+                    fprintf(gmn_log,"3g read error\n");
+                    pthread_exit((void *)-1);
+                }
+                bzero((void *) selfhd, sizeof(selfhd));
+                selfhd[0] = 6;
+                selfhd[1] = 2;
+                selfhd[2] = 21;
+                uint32_t *hd3 = (uint32_t *) (&selfhd[3]);
+                *hd3 = (len);
+                memcpy(&selfhd[7], buff, len);
+
+                /*
+                 * head lenth: 6
+                 * direction: 0 3g->gemini
+                 * type: 21 data to IUH
+                 */
+                //self-defined protocol head
+                send(rsock[1], selfhd, 7 + len, 0);
+                wifisend++;
+            }
+        }
+    }
+    return (void *) 0;
+}
+
+/*
+int monitor()
+{
+	ifconf.ifc_len = 512;
+	ifconf.ifc_buf = buf;
+
+	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
+	{
+		return -1;
+	}
+	ioctl(sockfd, SIOCGIFCONF, &ifconf);
+	close(sockfd);
+
+	ifreq = (struct ifreq*) buf;
+	for (i = (ifconf.ifc_len / sizeof(struct ifreq)); i > 0; i--)
+	{
+		if (strcmp(ifreq->ifr_ifrn.ifrn_name, "rmnet0") != 0)
+		{
+			ifreq++;
+            count++;
+			continue;
+		}
+		if (strcmp(ifreq->ifr_ifrn.ifrn_name, "wlan0") != 0)
+		{
+			ifreq++;
+            count++;
+			continue;
+		}
+	}
+    if(count==2)
+        return 1;
+    else 
+        return 0;
+}
+*/
+
+void insmod()
+{
+    system("svc wifi disable");
+    system("sed -i 's/ctrl_interface=wlan0/#ctrl_interface=wlan0/g' gmn_file");
+    system("chown wifi:wifi wpa_supplicant.conf");
+    system("insmod /system/lib/modules/wlan.ko");
+    system("netcfg wlan0 up");
+    system("su -c 'wpa_supplicant -P/data/misc/wifi/wpa_supplicant.pid -iwlan0 -c/data/misc/wifi/wpa_supplicant.conf -B'");
+    system("dhcpcd wlan0");
+}
+   // FILE *wpa = fopen("wpa_supplicant","a+");
+
+void rmmod()
+{
+    FILE *file = fopen("/data/misc/wifi/wpa_supplicant.pid","r");
+    char *cmd1;
+    int *wpa_pid;
+    system("netcfg wlan0 down");
+    system("rmmod /system/lib/modules/wlan.ko");
+    
+    fscanf(file,"%d",wpa_pid);
+    sprintf(cmd1,"kill %d",*wpa_pid);
+    system(cmd1);
+    system("sed -i 's/#ctrl_interface=wlan0/ctrl_interface=wlan0/g' gmn_file");
+    system("chown wifi:wifi wpa_supplicant.conf");
+}
+
+void check_wpa_conf()
+{
+    char str[80];
+    char *stc1 = "#ctrl_interface=wlan0";
+    char *stc2 = "ctrl_interface=wlan0";
+    FILE *wpa_conf = fopen("/data/misc/wifi/wpa_supplicant.conf","r");
+    if(wpa_conf == NULL)
+    {
+        fprintf(gmn_log,"%s\n", "check_wpa_conf open error!"); 
+        CONF_FLAG =  0;
+    }
+    fscanf(wpa_conf,"%s",str);
+    while(!feof(wpa_conf))
+    {
+        if(!strcmp(str,stc1))
+        {
+            CONF_FLAG =  1;
+            return;
+        }
+        if(!strcmp(str,stc2))
+        { 
+            CONF_FLAG =  0;
+            return;
+        }
+         continue;
+
+    }
+    
+}
+
+void vsock_close()
+{
+    close(socks.vsock);
+     
+    struct rtentry rt;
 	struct sockaddr_in dst;
+
 	//struct sockaddr_in gw;
-	struct sockaddr_in genmask;
+	struct sockaddr_in gen;
 
 	memset(&rt, 0, sizeof(rt));
 
-	genmask.sin_family = PF_INET;
-	genmask.sin_addr.s_addr = inet_addr("0.0.0.0");
+	bzero(&gen, sizeof(struct sockaddr_in));
+	gen.sin_family = PF_INET;
+	gen.sin_addr.s_addr = inet_addr("255.255.255.252");
 
 	bzero(&dst, sizeof(struct sockaddr_in));
-	dst.sin_addr.s_addr = inet_addr("0.0.0.0");
-
+	dst.sin_addr.s_addr = inet_addr("192.168.1.0");
 	dst.sin_family = PF_INET;
-	rt.rt_dst = *(struct sockaddr*) &dst;
-	rt.rt_genmask = *(struct sockaddr*) &genmask;
+    del_route(&rt);
 
-	del_route(&rt);
-	add_route(&OLD_DEFAULT_ROUTE);
+	memset(&rt, 0, sizeof(rt));
 
-	if (close(tgfd) == -1)
-	{
-		printf("error occurred in tgfd release:%d\n ", errno);
-	}
+	bzero(&gen, sizeof(struct sockaddr_in));
+	gen.sin_family = PF_INET;
+	gen.sin_addr.s_addr = inet_addr("255.255.255.255");
 
-	if (close(wififd) == -1)
-	{
-		printf("error occurred in wififd release:%d\n", errno);
-	}
+	bzero(&dst, sizeof(struct sockaddr_in));
+	dst.sin_addr.s_addr = inet_addr("192.168.1.254");
+	dst.sin_family = PF_INET;
+    del_route(&rt);
 
-#ifdef DEBUG
-	printf("route recover successfully.\n");
-#endif
+	memset(&rt, 0, sizeof(rt));
 
-	//exit(0);
+	bzero(&gen, sizeof(struct sockaddr_in));
+	gen.sin_family = PF_INET;
+	gen.sin_addr.s_addr = inet_addr("255.255.255.255");
 
+	bzero(&dst, sizeof(struct sockaddr_in));
+	dst.sin_addr.s_addr = inet_addr("10.10.10.253");
+	dst.sin_family = PF_INET;
+    del_route(&rt);
 }
+
+void set_3g_default(char *ip)
+{
+	struct rtentry rt;
+	struct sockaddr_in dst;
+	struct sockaddr_in gen;
+
+	memset(&rt, 0, sizeof(rt));
+
+	bzero(&gen, sizeof(struct sockaddr_in));
+	gen.sin_family = PF_INET;
+	gen.sin_addr.s_addr = inet_addr("0.0.0.0");
+
+	bzero(&dst, sizeof(struct sockaddr_in));
+	dst.sin_addr.s_addr = inet_addr(ip);
+	dst.sin_family = PF_INET;
+
+	rt.rt_dst = *(struct sockaddr*) &dst;
+	rt.rt_genmask = *(struct sockaddr*) &gen;
+	add_route(&rt);
+}
+
 
 int vsock_open(char *ip)
 {
@@ -1140,40 +1422,25 @@ int vsock_open(char *ip)
 }
 
 
-void dual_channel_shutdown()
-{
-	if (tgfd)
-	{
-		if (shutdown(tgfd, SHUT_RDWR) == -1)
-		{
-			printf("shutdown tgfd error!\n");
-			close(tgfd);
-		}
-	}
-	if (wififd)
-	{
-		shutdown(wififd, SHUT_RDWR);
-		close(wififd);
-	}
-#ifdef DEBUG
-	printf("3g and wifi socket all closed.\n");
-#endif
-	recovery_route();
-	exit(0);
-
-}
 
 void double_channel_uicontrol()
 {
 	int server_sockfd, client_sockfd;
 	int server_len, client_len;
-    int start,close;
 	struct sockaddr_in server_address;
 	struct sockaddr_in client_address;
 	//int initflag=0;
 	char buffer[8]; //receive buff of message
 
-	memset((void*)buffer, '\0', sizeof(buffer));
+	/*
+	 * control information
+	 */
+	char one[] = "1:1\0";
+	char shuntper[] = "auto\0";
+	char closeg[] = "close\0";
+	char initfun[] = "init\0";
+
+	memset(&buffer, '\0', sizeof(buffer));
 
 	if ((server_sockfd = socket(AF_INET, SOCK_STREAM, 0)) < 0)
 	{
@@ -1197,10 +1464,7 @@ void double_channel_uicontrol()
 
 	int readlen;
 	//read and write
-    int gmn_status=0;
-    int new_gmn;
-    char *sht_status="0:0";
-    char *new_sht=NULL;
+
 #ifdef UIDEBUG
 	printf("android UI control panel initialized...\n");
 #endif
@@ -1212,62 +1476,56 @@ void double_channel_uicontrol()
 				(struct sockaddr *) &client_address, (socklen_t *) &client_len);
 
 		memset((void *) buffer, '\0', sizeof(buffer));
-        readlen = read(client_sockfd, buffer, sizeof(buffer));//app should best to wait for 2s to confirm the user's choice
+		readlen = read(client_sockfd, buffer, sizeof(buffer));
 
 #ifdef PACKET
 		printf("read %d bytes\n", readlen);
 #endif
 
-		if (readlen != 0)//app should only send the 4 message below !!!
+		if (readlen != 0)
 		{
+			if ((initflag == 0)
+					&& (strcmp((const char*) buffer, (const char*) initfun) == 0))
+			{
+				initflag = 1;
+				//autoshunt = 1;
+				printf("init\n\n");
+				sleep(3);
+				close(client_sockfd);
+				continue;
+			}
+			if (strcmp((const char*) buffer, (const char*) one) == 0)
+			{
+				//autoshunt = 1;
+				shunt(tgfd);
+				printf("1:1set\n\n");
+				sleep(3);
+				close(client_sockfd);
+				continue;
+			}
+			if (strcmp((const char*) buffer, (const char*) shuntper) == 0)
+			{
+				shunt_auto(tgfd);
+				printf("auto\n\n");
+				sleep(3);
+				close(client_sockfd);
+				continue;
+			}
+			if (strcmp((const char*) buffer, (const char*) closeg) == 0)
+			{
+				printf("function close\n\n");
+				sleep(3);
+				close(client_sockfd);
+				continue;
+			}
+			else
+			{
+				printf("communication with ue end with error!\n\n");
+				sleep(3);
+				close(client_sockfd);
+				continue;
+			}
 
-            switch(buffer){
-                case "1 0 1:0":
-                    array[0].i = 1;
-                    array[1].i = 0;
-                    array[2].vs = 1:0;
-                    //new_status = 1;
-                    break;
-                case "1 1 0:0":
-                    array[0].i = 1;
-                    array[1].i = 1;
-                    array[2].vs = 0:0;
-                    //new_status = 1;
-                    break;
-                case "1 0 1:1":
-                    array[0].i = 1;
-                    array[1].i = 0;
-                    array[2].vs = 1:1;
-                    //new_status = 1;
-                    break;
-                case "1 0 0:1":
-                    array[0].i = 1;
-                    array[1].i = 0;
-                    array[2].vs = 0:1;
-                    //new_status = 1;
-                    break;
-                case "0 0 0:0"://turn off the GMN
-                    array[0].i = 0;
-                    array[1].i = 0;
-                    array[2].vs = 0:0;
-                    //new_status = 0;
-            }
-			if(gmn_status != array[0].i)
-            {
-				if(new_status)
-                    insmod();
-                else
-                    rmmod();
-                gmn_status = array[0].i;
-            }
-            if(sht_status != array[2].vs)
-            {
-                send_shunt(array[2].vs);
-                sht_status = array[2].vs;
-            }
-
-            close(client_sockfd);
-            sleep(1);
 		}
 
 	}
@@ -1290,228 +1548,30 @@ int send_shunt(char * rate)
     return 0;
 }
 
-int int2str(char *str, int num)
-{
-    int i = 0;
-    int t = num;
-    for(i = 0; t; i++, t = t/10);
-    str[i] = 0;
-    t = i;
-    while(i) {
-        str[--i] = num%10 +'0';
-        num = num/10;
-    }
-    return t;
-}
-
-void * recv_process(void *p)
-{
-	int vsock;
-	int *rsock;
-	struct sock* arg = NULL;
-	arg = (struct sock*) p;
-	vsock = arg->vsock;
-	rsock = arg->rsock;
-
-	unsigned char buff[MAX_BUFF];
-	struct epoll_event event;
-	struct epoll_event events[MAX_IF];
-	int epfd = epoll_create(MAX_IF);
-    int epfds = 0;
-    int i;
-    int seq = 0;
-	int32_t len = 0;
-    int lasttemp = 0;
-	socklen_t alen;
-	alen = sizeof(struct sockaddr_in);
-
-	event.events = EPOLLIN;
-    event.data.fd = rsock[0];
-    epoll_ctl(epfd, EPOLL_CTL_ADD, rsock[0], &event);
-    event.data.fd = rsock[2];
-    epoll_ctl(epfd, EPOLL_CTL_ADD, rsock[2], &event);
-	//use epoll for a lockless mutli-receive
-	while ((epfds = epoll_wait(epfd, events, 2, -1)) != -1)
-	{
-        for(i = 0; i < epfds; i++) {
-            if (!(events[i].events & EPOLLIN) )
-            {
-                perror("epoll_wait");
-                continue;
-            }
-
-            len = recvfrom(events[i].data.fd, (void *) buff, MAX_BUFF, 0,NULL,NULL);
-            seq = *(uint16_t*)(buff+7);
-            if( ((seq<firn) || (seq>(MAX_SEQ-SEQ_TOR) && firn<SEQ_TOR)) && !(seq<SEQ_TOR && firn>(MAX_SEQ-SEQ_TOR)) ) {
-#ifdef DEB_DETAIL
-                printf("get lost package from fd %d, which seq = %d \n", events[i].data.fd, seq);
-#endif
-                write(vsock, (void *)(buff+9), len-9);
-            } else {
-#ifdef DEB_DETAIL
-                printf("get new package from fd %d, which seq = %d \n", events[i].data.fd, seq);
-#endif
-                memcpy((void *) (&DATABUFF[seq]), buff, (size_t) len);
-
-                if(events[i].data.fd == rsock[0]) {
-                    if((seq>(MAX_SEQ-SEQ_TOR) && lasttg<SEQ_TOR) || (lasttg>(MAX_SEQ-SEQ_TOR) && seq<SEQ_TOR))
-                        lasttg = lasttg>seq?seq:lasttg; // get the little one
-                    else
-                        lasttg = lasttg<seq?seq:lasttg; // get the bigger one
-                } 
-
-                // lastn get the slow one
-                //lasttg >= firn
-                if(firn != lasttg)
-                    pthread_cond_signal(&WAIT_RECV);
-            }
-        } 
-    }
-#ifdef ERR
-    printf("[ERR]: epoll failed, and stop receiving\n");
-#endif
-	return (void *) 0;
-}
 
 
-void * buff2tun0_process(void *p)
-{
-    int vsock;
-    int32_t len = 0;
-    struct sock* arg = NULL;
-    arg = (struct sock*) p;
-    vsock = arg->vsock;
-    //slepp(1);
-    while (1)
-    {
-        //lasttg >= firn
-        if(lasttg != firn)
-        {
-            if(DATABUFF[firn][0])
-            {
-                len = *((uint32_t *)(DATABUFF[firn]+3));
-                write(vsock, (void *)(DATABUFF[firn]+9), len-2);
-                DATABUFF[firn][0] = 0;
-#ifdef DEB_DETAIL
-                printf("upload package, which seq = %d, firn = %d, lasttg = %d\n",
-                        *(uint16_t*)(DATABUFF[firn]+7), firn, lasttg );
-#endif
-            } else {
-#ifdef DEBUG
-                printf("lost data package,firn=%d,lasttg=%d\n",firn,lasttg);
-#endif
-            }
-            firn = (firn + 1) % MAX_SEQ;
-        } else {
-#ifdef DEBUG
-                printf("waitting recv package,firn=%d,lasttg=%d\n",firn,lasttg);
-#endif
-            pthread_cond_wait(&WAIT_RECV, &MTX_RECV);
-            pthread_mutex_unlock(&MTX_RECV);
-        }
-    }
-    return (void *) 0;
-}
 
 /*
  * determine whether to send data through 3g or wifi interface,
  *
  */
-void * send_process(void *p)
+
+int gmn_connect()
 {
-    int vsock;
-    int *rsock;
-    int tgflag = 1; //mark if send through 3G channel
-    struct sock* arg = NULL;
-    arg = (struct sock*) p;
 
-    vsock = arg->vsock;
-    rsock = arg->rsock;
-    uint32_t len;
-    char buff[MAX_BUFF];
-    uint8_t selfhd[2048];
+    //signal(SIGTERM, recovery_route);
+    //signal(SIGPIPE, SIG_IGN);
 
-    bzero((void *) selfhd, sizeof(selfhd));
-    int count;
-    while (1)
-    {
-        if (tgflag == 1) //send through 3g interface
-        {
-            //tgflag = 0;
-            bzero((void *) buff, sizeof(buff));
-            len = read(vsock, buff, MAX_BUFF);
-            if (len == -1)
-            {
-                printf("3g read error\n");
-            }
-            else
-            {
-                //printf("read %d bytes\n", len);
-            }
-
-            bzero((void *) selfhd, sizeof(selfhd));
-            selfhd[0] = 6;
-            selfhd[1] = 0;
-            selfhd[2] = 21;
-            uint32_t *hd3 = (uint32_t *) (&selfhd[3]);
-            *hd3 = len;
-            memcpy(&selfhd[7], buff, len);
-
-            /*
-             * head lenth: ?
-             * direction: 0 3g->gemini
-             * type: 21 data to IUH
-             */
-            //self-defined protocol head
-            sendto(rsock[0], selfhd, 7 + len, 0,
-                    (struct sockaddr *) &serveraddr, sizeof(serveraddr));
-
-        }
-        else //send through wifi channel
-        {
-            //tgflag = 1; //change the flag to send through 3g interface
-            bzero((void *) buff, sizeof(buff));
-            len = read(vsock, buff, MAX_BUFF);
-            {
-                if (len == -1)
-                {
-                    perror("wifi send length error:");
-                    //exit(-1);
-                }
-                bzero((void *) selfhd, sizeof(selfhd));
-                selfhd[0] = 6;
-                selfhd[1] = 2;
-                selfhd[2] = 21;
-                uint32_t *hd3 = (uint32_t *) (&selfhd[3]);
-                *hd3 = (len);
-                memcpy(&selfhd[7], buff, len);
-
-                /*
-                 * head lenth: 6
-                 * direction: 0 3g->gemini
-                 * type: 21 data to IUH
-                 */
-                //self-defined protocol head
-                send(rsock[1], selfhd, 7 + len, 0);
-
-            }
-        }
-    }
-    return (void *) 0;
-}
-
-void *gmn_init()
-{
+    bzero((void *) ip, sizeof(ip));
 
     char rtgbuff[MAX_BUFF] = "";
     char rwifibuff[MAX_BUFF] = "";
     char sbuff[MAX_BUFF] = "";
 
-    signal(SIGTERM, recovery_route);
-    signal(SIGPIPE, SIG_IGN);
-
-    bzero((void *) ip, sizeof(ip));
-
+    pthread_t tgs;
+    pthread_t tgr;
+    pthread_t initfl;
+    pthread_t b2t;
 
     bzero((void *) rtgbuff, sizeof(rtgbuff));
     bzero((void *) rwifibuff, sizeof(rwifibuff));
@@ -1526,196 +1586,437 @@ void *gmn_init()
     settghostrt();
     setwifihostrt();
 
-    if (get_local_ip((char *) ip) == 0)
+    if (get_3g_ip((char *) ip) == 0)
     {
-        printf("本机IP地址是:%s\n", ip);
+        fprintf(gmn_log,"本机3g地址是:%s\n", ip);
     }
     else
     {
-        printf("无法获取本机IP地址\n");
+        fprintf(gmn_log,"无法获取本机3g地址\n");
     }
 
     /*
      * establish 3g socket
      */
     server_for_gemini();
-    printf("*******server_for_gemini running...\n\n");
+    fprintf(gmn_log,"*******server_for_gemini running...\n\n");
 
-    printf("client_for_gemini start...\n");
+    fprintf(gmn_log,"client_for_gemini start...\n");
 
     /*
      * establish wifi socket
      */
     client_for_gemini();
-    printf("*******client_for_gemini running...\n\n");
-
-    if ((double_ch_flag_gmn && double_ch_flag_app) == 0)//only 3g channel, do nothing(set by gemini in wifi socket channel)
-    {
-        printf("will not enable dual channel\n");
-    }
-    else if ((double_ch_flag_gmn && double_ch_flag_app) == 1)	//dual interface
-    {
-
-        if (tgfd == 0)
-        {
-            printf("3g address initialize failed!\n");
-        }
-//        shunt(tgfd);
-        send_shunt(array[2].vs);
-
-#ifdef DEBUG
-        printf("shunt algorithm done.\n");
-#endif
-
-        socks.vsock = vsock_open("192.168.1.100");
-
-#ifdef DEBUG
-        printf("socks.vsock=%d\n", socks.vsock);
-        printf("vsock_open finished.\n");
-#endif
-
-        while (wififd == 0)	//wait for parent process to intialize wifiid
-        {
-            sleep(1);
-            printf("waiting for wifi initializing...\n");
-        }
-        socks.rsock[0] = tgfd;
-        socks.rsock[1] = wififd;
-        socks.rsock[2] = wifitrfd;
-        socks.rsock[3] = 0;
-
-#ifdef DEBUG
-        printf("3gfd=%d, wififd=%d, wifitrfd=%d, tunfd=%d\n", tgfd, wififd, wifitrfd, tunfd);
-        printf("rsock_open finished, now transport data through dual interface\n");
-#endif
-    gmnok = 1;
-
-
-    }
+    fprintf(gmn_log,"*******client_for_gemini running...\n\n");
+    send_shunt(RATE_FLAG);
+    return double_ch_flag_gmn;
 }
 
-int monitor()
-{
-    //查看手机3g和wifi是否up
-	int i = 0;
-    int count=0;
-	int sockfd;
-	struct ifconf ifconf;
-	struct ifreq *ifreq;
-	char buf[512];
-	char* ip;
-	/*
-	 * initial ifconf
-	 */
-	ifconf.ifc_len = 512;
-	ifconf.ifc_buf = buf;
 
-	if ((sockfd = socket(AF_INET, SOCK_DGRAM, 0)) < 0)
-	{
+
+int get_tun_route(struct rtentry *rt)
+{
+	FILE *source;
+	int has_tun;
+	struct sockaddr_in * p, *q;
+	if ((source = fopen("/proc/net/route", "r")) == NULL)
 		return -1;
-	}
-	/*
-	 * fatch all the possible interface information
-	 */
-	ioctl(sockfd, SIOCGIFCONF, &ifconf);
-	close(sockfd);
-
-	/*
-	 * fatch the ip address one by one
-	 */
-	ifreq = (struct ifreq*) buf;
-	for (i = (ifconf.ifc_len / sizeof(struct ifreq)); i > 0; i--)
+	fscanf(source, "%*[^\n]\n"); //skip the first line
+	while (get_route(source, rt) == 0) //read the default route
 	{
-		if (strcmp(ifreq->ifr_ifrn.ifrn_name, "rmnet0") != 0)
+		p = (struct sockaddr_in *) &(rt->rt_dst);
+		q = (struct sockaddr_in *) &(rt->rt_genmask);
+		if (p->sin_addr.s_addr == inet_addr("192.168.1.0")
+				&& q->sin_addr.s_addr == inet_addr("255.255.255.252"))
 		{
-			ifreq++;
-            count++;
-			continue;
-		}
-		if (strcmp(ifreq->ifr_ifrn.ifrn_name, "wlan0") != 0)
-		{
-			ifreq++;
-            count++;
-			continue;
+		    has_tun = 1;
+			break;
 		}
 	}
-    if(count==2)
-        return 1;
-    else 
-        return 0;
+	fclose(source);
+	if (has_tun == 1)
+		return 0;
+	else
+		return -2;
 }
 
-void insmood()
+void function1()
 {
-    system("svc wifi disable");
-    system("sed -i 's/ctrl_interface=wlan0/#ctrl_interface=wlan0/g' gmn_file");
-    system("chown wifi:wifi wpa_supplicant.conf");
-    system("insmod /system/lib/modules/wlan.ko");
-    system("netcfg wlan0 up");
-    system("su -c 'wpa_supplicant -P/data/misc/wifi/wpa_supplicant.pid -iwlan0 -c/data/misc/wifi/wpa_supplicant.conf -B'");
-    system("dhcpcd wlan0");
-}
-   // FILE *wpa = fopen("wpa_supplicant","a+");
+    fprintf(gmn_log,"cant connect with Station\n");
+    strcpy(app_msg,"cant connect with Station");
+    rmmod();
+    system("cp /data/misc/wifi/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf.gmn");
+    system("cp /data/misc/wifi/wpa_supplicant.conf.wifi /data/misc/wifi/wpa_supplicant.conf");
+    CONF_FLAG = 0;
+    GMN_FLAG = 0;
+    READY_FLAG = 0;
 
-void rmmod()
-{
-    FILE *file = fopen("/data/misc/wifi/wpa_supplicant.pid","r");
-    char *cmd1;
-    pid_t wpa_pid;
-    system("netcfg wlan0 down")
-    system("rmmod /system/lib/modules/wlan.ko");
-    
-    fscanf(file,"%d",wpa_pid);
-    sprintf(cmd1,"kill %d",wpa_pid);
-    system(cmd1);
-    system("sed -i 's/#ctrl_interface=wlan0/ctrl_interface=wlan0/g' gmn_file");
-    system("chown wifi:wifi wpa_supplicant.conf");
 }
 
-void check_wpa_conf()
-{
-    char str[80];
-    char *stc1 = "#ctrl_interface=wlan0"
-    char *stc2 = "ctrl_interface=wlan0"
-    FILE *wpa_conf = fopen("/data/misc/wifi/wpa_supplicant.conf","r");
-    if(file == NULL)
-    {
-        fprintf(gmn_log,"%s\n", "check_wpa_conf open error!"); 
-        CONF_FLAG =  0;
-    }
-    fscanf(wpa_conf,"%s",str);
-    while(!feof(wpa_conf))
-    {
-        if(!strcmp(str,stc1))
-        {
-            CONF_FLAG =  1;
-            return;
-        }
-        if(!strcmp(str,stc2))
-        { 
-            CONF_FLAG =  0;
-            return;
-        }
-         continue;
 
-    }
-    
-}
-
-void *pthread_env()
+void *pthread_monitor()
 {
     while(1)
     {
-        if(!GMN_FLAG)
+        if(GMN_FLAG)
         {
-            
-        }
-        else
-        {
-
+            pthread_cond_signal(&c_env);
         }
     }
 }
+
+void wifi_ip_tail()
+{
+    struct rtentry rt;
+    bzero(&rt,sizeof(struct rtentry));
+    if(get_tun_route(&rt)==0)
+    {
+        READY_FLAG = 1;
+        pthread_cond_signal(&c_gmn);
+        if((int)mnt==0)
+            pthread_create(&mnt,NULL,pthread_monitor,NULL);
+        pthread_mutex_lock(&m_env);
+        pthread_cond_wait(&c_env,&m_env);
+        pthread_mutex_unlock(&m_env);
+    }
+    else
+    {
+        socks.vsock = vsock_open("192.168.1.100");
+        if(gmn_connect())
+        {
+            READY_FLAG = 1;
+            pthread_cond_signal(&c_gmn);
+            socks.rsock[0] = tgfd;
+            socks.rsock[1] = wififd;
+            socks.rsock[2] = wifitrfd;
+            socks.rsock[3] = 0;
+            if((int)mnt==0)
+                pthread_create(&mnt,NULL,pthread_monitor,NULL);
+
+        }
+        else
+        {
+            function1();
+        }
+        pthread_mutex_lock(&m_env);
+        pthread_cond_wait(&c_env,&m_env);
+        pthread_mutex_unlock(&m_env);
+    
+    }
+}
+
+
+void *pthread_env()
+{
+    char ip[20];
+    struct rtentry rt;
+    pthread_mutex_init(&m_env,NULL);
+    pthread_cond_init(&c_env,NULL);
+    while(1)
+    {
+	    bzero(ip, sizeof(ip));
+        strcpy(app_msg,"");
+        if(!GMN_FLAG)
+        {
+            vsock_close(); 
+            if(CONF_FLAG)
+            {
+                rmmod();
+                system("cp /data/misc/wifi/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf.gmn");
+                system("cp /data/misc/wifi/wpa_supplicant.conf.wifi /data/misc/wifi/wpa_supplicant.conf");
+                CONF_FLAG = 0;
+            }
+            READY_FLAG = 0;
+            if(get_3g_ip(ip))
+            {
+                set_3g_default(ip); 
+            }
+            pthread_mutex_lock(&m_env);
+            pthread_cond_wait(&c_env,&m_env);
+            pthread_mutex_unlock(&m_env);
+
+        }
+        else
+        {
+            if(get_wifi_ip(ip) && CONF_FLAG==0)
+            {
+                fprintf(gmn_log,"%s\n","please turn off the wifi first,and then turn 0n 3g!\n");
+                strcpy(app_msg,"please turn off the wifi first,and then turn on 3g!");
+                GMN_FLAG = 0;
+                READY_FLAG = 0;
+                pthread_mutex_lock(&m_env);
+                pthread_cond_wait(&c_env,&m_env);
+                pthread_mutex_unlock(&m_env);
+            }
+            else
+            {
+	            bzero(ip, sizeof(ip));
+                if(get_3g_ip(ip))
+                {
+                    if(CONF_FLAG==1)
+                    {
+	                    bzero(ip, sizeof(ip));
+
+                        if(get_wifi_ip(ip))
+                        {
+                            wifi_ip_tail();
+                        }
+                        else
+                        {
+	                        bzero(ip, sizeof(ip));
+                            insmod();
+                            sleep(1);
+                            if(get_wifi_ip(ip))
+                            {
+                                wifi_ip_tail();
+                            }
+                            else
+                            {
+                                fprintf(gmn_log,"wifi initailizing failed!\n");
+                                strcpy(app_msg,"wifi initailizing failed!");
+                                function1();
+                                pthread_mutex_lock(&m_env);
+                                pthread_cond_wait(&c_env,&m_env);
+                                pthread_mutex_unlock(&m_env);
+                            }
+                        }
+                        
+                            
+                    }
+                    else
+                    {
+                        system("svc wifi diable");
+                        system("cp /data/misc/wifi/wpa_supplicant.conf /data/misc/wifi/wpa_supplicant.conf.wifi");
+                        system("cp /data/misc/wifi/wpa_supplicant.conf.gmn /data/misc/wifi/wpa_supplicant.conf");
+                    }
+                }
+                else
+                {
+                    READY_FLAG = 0;
+                    GMN_FLAG = 0;
+                    fprintf(gmn_log,"%s\n","3g initialing failed ,3g has no ip\n");
+                    strcpy(app_msg,"3g initialing failed ,3g has no ip");
+                    pthread_cond_wait(&c_env,&m_env);
+                }
+            }
+        }
+    }
+}
+
+void *pthread_gemini()
+{
+    unsigned char *close_msg = "204";
+	struct sockaddr_in set_address;
+	set_address.sin_family = AF_INET;
+	set_address.sin_addr.s_addr = inet_addr("192.168.1.254");
+	set_address.sin_port = htons(GTG);
+    for(;;)
+    {
+        if(GMN_FLAG)
+        {
+            if(READY_FLAG)
+            {
+                if((int)tgs==0)
+                {
+                    if (pthread_create(&tgs, NULL, send_process, (void *) &socks) != 0)
+                    {
+                        fprintf(gmn_log,"*****server thread create error:%d\n", errno);
+                        exit(-1);
+                    }
+                }
+                if((int)tgr==0)
+                {
+
+                    /*
+                     * the recv_process need to deal with control information
+                     */
+                    if (pthread_create(&tgr, NULL, recv_process, (void *) &socks) != 0)
+                    {
+                        fprintf(gmn_log,"recv_process thread create error\n");
+                        exit(-1);
+                    }
+                }
+                if((int)b2t==0)
+                {
+                    if (pthread_create(&b2t, NULL, buff2tun0_process, (void *) &socks) != 0)
+                    {
+                        fprintf(gmn_log,"buff2tun0_process thread create error\n");
+                        exit(-1);
+                    }
+                            
+                }
+                
+            }
+
+        }
+        else
+        {
+	        sendto(tgfd, (void *) close_msg, sizeof(close_msg), 0,
+			(struct sockaddr*) &set_address, sizeof(set_address));
+            pthread_cancel(tgs);
+            pthread_cancel(tgr);
+            pthread_cancel(b2t);
+            pthread_mutex_destroy(MTX_RECV);
+            pthread_cond_destroy(WAIT_RECV);
+            free(MTX_RECV);
+            free(WAIT_RECV);
+            
+        }
+        pthread_mutex_lock(&m_gmn);
+        pthread_cond_wait(&c_gmn,&m_gmn);
+        pthread_mutex_unlock(&m_gmn);
+
+    }
+
+}
+
+int opt(char *message)
+{
+    if(!strcmp(message,"G1#"))
+        return 1;
+    if(!strcmp(message,"G2#"))
+        return 2;
+    if(!strcmp(message,"G3#"))
+        return 3;
+    if(!strcmp(message,"G4#"))
+        return 4;
+    if(!strcmp(message,"G5#"))
+        return 5;
+    if(!strcmp(message,"G6;1:1#"))
+        return 611;
+    if(!strcmp(message,"G6;1:0#"))
+        return 610;
+    if(!strcmp(message,"G6;0:1#"))
+        return 601;
+    if(!strcmp(message,"G7#"))
+        return 7;
+    return 0;
+}
+
+
+void *pthread_ui()
+{
+    int app_sockfd,cli_sockfd;
+    struct sockaddr_in server_address;
+    int server_len;
+    int readlen;
+	memset(&server_address, 0, sizeof(server_address));
+    if((app_sockfd = socket(AF_INET,SOCK_DGRAM,0)) < 0 )
+    {
+        fprintf(gmn_log,"error in app socket creating!\n");
+        exit(-1);
+    }
+    server_address.sin_family = AF_INET;
+    //inet_pton(AF_INET,"127.0.0.1",);
+    server_address.sin_addr.s_addr = inet_addr("127.0.0.1");
+    server_address.sin_port = htons(APP);
+    server_len = sizeof(server_address);
+
+    if (bind(app_sockfd, (struct sockaddr *) &server_address , server_len) < 0)
+    {
+        fprintf(gmn_log,"error occurred in wifi data transfer socket bind\n");
+        exit(-1);
+    }
+	listen(app_sockfd, 5);
+    for(;;)
+    {
+        cli_sockfd = accept(app_sockfd,NULL,NULL);
+        memset((void *)msg,0,sizeof(msg));
+        readlen = read(cli_sockfd,msg,sizeof(msg));
+        if(readlen!=0)
+        {
+            switch(opt(msg))
+            {
+                case 1:
+                {
+                    write(cli_sockfd,msg,readlen);
+                    break;
+                }
+                case 2:
+                {
+                    sprintf(msg,"G2;%d;%d;%s#",GMN_FLAG,AUTO_FLAG,RATE_FLAG);
+                    write(cli_sockfd,msg,sizeof(msg));
+                    break;
+                }    
+                case 3:
+                {
+                    GMN_FLAG = 1;
+                    pthread_cond_signal(&c_env);
+                    while(1)
+                    {
+                        if(READY_FLAG==0)
+                        {
+                            pthread_mutex_lock(&m_ui);
+                            pthread_cond_wait(&c_ui,&m_ui);
+                            pthread_mutex_unlock(&m_ui);
+                        }
+                        else if(gmnok==3)
+                        {
+                           break; 
+                        }
+                    }
+                    
+                    if(strcmp(app_msg,""))
+                    {
+                        sprintf(msg,"G3;Success#");
+                    }
+                    else
+                    { 
+                        sprintf(msg,"G3;ERROR:%s#","app_msg");
+                    }
+                    write(cli_sockfd,msg,sizeof(msg));
+                    
+                    break;
+                }
+                case 4:
+                {
+                    GMN_FLAG = 0;
+                    pthread_cond_signal(&c_gmn);
+                    pthread_cond_signal(&c_env);
+                    sleep(2);
+                    sprintf(msg,"G4;Success#");
+                    write(cli_sockfd,msg,readlen);
+                    break;
+                }
+                case 5://auto mod
+                {
+                    AUTO_FLAG = 1;
+                    break;
+                }
+                case 611:
+                {
+                    AUTO_FLAG = 0;
+                    strcpy(RATE_FLAG,"1:1");
+                    send_shunt(RATE_FLAG);
+                    break;
+                }
+                case 601:
+                {
+                    AUTO_FLAG = 0;
+                    strcpy(RATE_FLAG,"0:1");
+                    send_shunt(RATE_FLAG);
+                    break;
+                }
+                case 610:
+                {
+                    AUTO_FLAG = 0;
+                    strcpy(RATE_FLAG,"1:0");
+                    send_shunt(RATE_FLAG);
+                    break;
+                }
+                case 7:
+                {
+                    sprintf(msg,"G7;%d;%d;%d;%d#",tgrecv,tgsend,wifirecv,wifisend);
+                    write(cli_sockfd,msg,sizeof(msg));
+                    break;
+                    
+                }
+                
+            }
+        }
+    }
+}
+
 
 int main(int argc, char *argv[])
 {
@@ -1725,7 +2026,7 @@ int main(int argc, char *argv[])
     {
         gmn_struct.GMN_FLAG = 0;
         gmn_struct.AUTO_FLAG = 0;
-        strcpy(gmn_struct.RATE,"1:1");
+        strcpy(gmn_struct.RATE_FLAG,"1:1");
     }
     else
     {
@@ -1734,7 +2035,7 @@ int main(int argc, char *argv[])
     }
     GMN_FLAG = gmn_struct.GMN_FLAG;
     AUTO_FLAG = gmn_struct.AUTO_FLAG;
-    strcpy(RATE, gmn_struct.RATE);
+    strcpy(RATE_FLAG, gmn_struct.RATE_FLAG);
     
 
     READY_FLAG = 0;
