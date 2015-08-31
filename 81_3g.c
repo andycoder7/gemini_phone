@@ -962,8 +962,7 @@ int setwifihostrt()
 	hostrt.rt_genmask = *(struct sockaddr*) &genmask;
 
 	hostrt.rt_flags = RTF_UP | RTF_HOST;
-	hostrt.rt_dev = "wlan0";
-	add_route(&hostrt);
+	hostrt.rt_dev = "wlan0";mZ	add_route(&hostrt);
 	return 1;
 }
 
@@ -1019,10 +1018,9 @@ int route_change(char * interface_name)
 	rt.rt_genmask = *(struct sockaddr*) &genmask;
 
 	del_route(&rt);
-	del_route(&rt);
+	//del_route(&rt);
 	rt.rt_flags = RTF_UP;
 	rt.rt_dev = interface_name;
-	add_route(&rt);
 
 	dst_3g.sin_family = PF_INET;
 	dst_3g.sin_addr.s_addr = inet_addr("192.168.1.0");
@@ -1030,6 +1028,7 @@ int route_change(char * interface_name)
 	genmask_3g.sin_family = PF_INET;
 	genmask_3g.sin_addr.s_addr = inet_addr("255.255.255.252");
 	rt.rt_genmask = *(struct sockaddr*) &genmask_3g;
+	add_route(&rt);
 	//del_route(&rt);
 	return 0;
 }
@@ -1529,7 +1528,7 @@ int main(int argc, char *argv[])
             send_shunt("1:4");
 
 #ifdef DEBUG
-        printf("shunt algorithm done.\n");
+        printf("shunt algoriwthm done.\n");
 #endif
 
         socks.vsock = vsock_open("192.168.1.100");
